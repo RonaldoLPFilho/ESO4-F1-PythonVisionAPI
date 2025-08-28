@@ -1,76 +1,93 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import base64, time, json, os
+from PIL import Image
+import base64, time, json, os, io
 
-from .preprocess import load_image_from_bytes
-from .inference import predict_image, MODEL_VERSION
+from .inference_clip import (
+    predict_zeroshot, predict_prototype, MODEL_VERSION,
+    add_prototype, reset_prototypes, stats_prototypes
+)
 
-app = FastAPI(title="Vision Core", version="0.1.0")
+app = FastAPI(title="Vision Core (CLIP few-shot)", version="0.2.0")
 
 class Base64Image(BaseModel):
     image_base64: str
 
+class LabelledBase64(BaseModel):
+    image_base64: str
+    label: str  # "saudavel" | "doente"
+
 @app.get("/health")
 def health():
-    return {"Status": "OK"}
-
+    return {"status": "ok", "model_version": MODEL_VERSION}
 
 @app.get("/metrics")
 def metrics():
-    path = os.path.join(os.path.dirname(__file__), "metrics.json")
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return data
-    except Exception:
-        return{
-            "model_version": MODEL_VERSION,
-            "accuracy": None,
-            "precision": None,
-            "recall": None,
-            "f1": None,
-            "tested_at": None
-        }
-    
+    return {"model_version": MODEL_VERSION, "prototypes": stats_prototypes()}
+
+def _bytes_to_image(b: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(b)).convert("RGB")
+
 @app.post("/predict")
 async def predict(image: UploadFile = File(None)):
-    """
-    Aceita multipart `image` 
-    """
     if image is None:
-        raise HTTPException(status_code=400, detail="Enviar campo multipart 'image'")
+        raise HTTPException(status_code=400, detail="Enviar campo multipart 'image'.")
     t0 = time.time()
     content = await image.read()
-    img = load_image_from_bytes(content)
-    label, conf = predict_image(img)
-    ms = int((time.time() - t0) * 1000)
+    img = _bytes_to_image(content)
 
+    # Tenta protótipo; se não houver, cai no zero-shot
+    label, conf, meta = predict_prototype(img)
+    ms = int((time.time() - t0) * 1000)
     return JSONResponse({
         "label": label,
         "confidence": conf,
         "model_version": MODEL_VERSION,
-        "processing_ms": ms
+        "processing_ms": ms,
+        "mode": meta["mode"]
     })
 
 @app.post("/predict/base64")
 async def predict_base64(payload: Base64Image):
-    """
-    Alternativa para enviar em abse64
-    """
     try:
         raw = base64.b64decode(payload.image_base64)
     except Exception:
-        raise HTTPException(status_code=400, detail="Base64 inválido")
-    
+        raise HTTPException(status_code=400, detail="Base64 inválido.")
     t0 = time.time()
-    img = load_image_from_bytes(raw)
-    label, conf = predict_image(img)
+    img = _bytes_to_image(raw)
+    label, conf, meta = predict_prototype(img)
     ms = int((time.time() - t0) * 1000)
-
-    return JSONResponse({
+    return {
         "label": label,
         "confidence": conf,
         "model_version": MODEL_VERSION,
-        "processing_ms": ms
-    })
+        "processing_ms": ms,
+        "mode": meta["mode"]
+    }
+
+# ---------- Few-shot maintenance ----------
+@app.post("/prototype/add")
+async def prototype_add(payload: LabelledBase64):
+    try:
+        raw = base64.b64decode(payload.image_base64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Base64 inválido.")
+    img = _bytes_to_image(raw)
+    try:
+        add_prototype(payload.label)
+    except TypeError:
+        # se a assinatura da função mudou, tente com img:
+        add_prototype(payload.label, img)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "prototypes": stats_prototypes()}
+
+@app.post("/prototype/reset")
+def prototype_reset():
+    reset_prototypes()
+    return {"ok": True, "prototypes": stats_prototypes()}
+
+@app.get("/prototype/stats")
+def prototype_stats():
+    return {"prototypes": stats_prototypes()}
