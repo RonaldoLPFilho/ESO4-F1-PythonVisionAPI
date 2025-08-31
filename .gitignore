@@ -5,3 +5,10 @@ __pycache__/
 *.pyd
 .env
 .DS_Store
+
+# ML/DL weights
+*.pt
+*.onnx
+*.pth
+models/*.pt
+
