@@ -31,14 +31,18 @@ async def predict(image: UploadFile = File(None)):
     t0 = time.time()
     content = await image.read()
     img = _bytes_to_image(content)
-    label, conf = predict_image(img)
+    label, conf, meta = predict_image(img)
     ms = int((time.time() - t0) * 1000)
     return JSONResponse({
         "label": label,
         "confidence": conf,
         "model_version": MODEL_VERSION,
-        "processing_ms": ms
+        "processing_ms": ms,
+        "food": meta.get("food"),
+        "food_confidence": meta.get("food_confidence"),
+        "bbox": meta.get("bbox")
     })
+
 
 @app.post("/predict/base64")
 async def predict_base64(payload: Base64Image):
@@ -48,11 +52,14 @@ async def predict_base64(payload: Base64Image):
         raise HTTPException(status_code=400, detail="Base64 inválido.")
     t0 = time.time()
     img = _bytes_to_image(raw)
-    label, conf = predict_image(img)
+    label, conf, meta = predict_image(img)
     ms = int((time.time() - t0) * 1000)
     return {
         "label": label,
         "confidence": conf,
         "model_version": MODEL_VERSION,
-        "processing_ms": ms
+        "processing_ms": ms,
+        "food": meta.get("food"),
+        "food_confidence": meta.get("food_confidence"),
+        "bbox": meta.get("bbox")
     }

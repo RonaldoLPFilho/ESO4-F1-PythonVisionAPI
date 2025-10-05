@@ -138,17 +138,58 @@ def classify_fresh_vs_rotten(img: Image.Image, detected_name: Optional[str]) -> 
 # ================
 # API de inferência
 # ================
+# def predict_image(img: Image.Image):
+#     dets = [d for d in detect_food_regions(img, conf_thres=MIN_DET_CONF) if d[2] >= MIN_DET_CONF]
+
+#     if not dets:
+#         return "Não reconhecido", 0.0
+
+#     (bbox, name, det_conf) = dets[0]
+#     crop = crop_bbox(img, bbox)
+#     label, class_conf = classify_fresh_vs_rotten(crop, name)
+
+#     if MIN_CLASS_CONF and class_conf < MIN_CLASS_CONF:
+#         return "Não reconhecido", class_conf
+
+#     return label, class_conf
+
+def _food_pt(name_en: Optional[str]) -> Optional[str]:
+    if not name_en:
+        return None
+    m = {
+        "apple":"maçã","banana":"banana","orange":"laranja","strawberry":"morango","grape":"uva",
+        "watermelon":"melancia","pineapple":"abacaxi","mango":"manga","papaya":"mamão","avocado":"abacate",
+        "tomato":"tomate","lettuce":"alface","cabbage":"repolho","broccoli":"brócolis","cauliflower":"couve-flor",
+        "carrot":"cenoura","cucumber":"pepino","zucchini":"abobrinha","eggplant":"berinjela",
+        "bell pepper":"pimentão","onion":"cebola","garlic":"alho","potato":"batata","corn":"milho",
+        "peas":"ervilha","beans":"feijão","fruit":"fruta","vegetable":"legume","food":"alimento","dish":"prato","meal":"refeição"
+    }
+    return m.get(name_en.lower(), name_en)
+
 def predict_image(img: Image.Image):
+    """
+    Retorna (label_pt, confidence, meta_dict)
+    label: 'saudável' | 'doente' | 'Não reconhecido'
+    meta: {'food': <pt|en>, 'food_confidence': float, 'bbox': [x1,y1,x2,y2] | None}
+    """
     dets = [d for d in detect_food_regions(img, conf_thres=MIN_DET_CONF) if d[2] >= MIN_DET_CONF]
 
     if not dets:
-        return "Não reconhecido", 0.0
+        return "Não reconhecido", 0.0, {"food": None, "food_confidence": 0.0, "bbox": None}
 
-    (bbox, name, det_conf) = dets[0]
+    (bbox, name_en, det_conf) = dets[0]
     crop = crop_bbox(img, bbox)
-    label, class_conf = classify_fresh_vs_rotten(crop, name)
+    label, class_conf = classify_fresh_vs_rotten(crop, name_en)
 
     if MIN_CLASS_CONF and class_conf < MIN_CLASS_CONF:
-        return "Não reconhecido", class_conf
+        return "Não reconhecido", class_conf, {
+            "food": _food_pt(name_en),
+            "food_confidence": float(det_conf),
+            "bbox": [int(b) for b in bbox],
+        }
 
-    return label, class_conf
+    return label, class_conf, {
+        "food": _food_pt(name_en),
+        "food_confidence": float(det_conf),
+        "bbox": [int(b) for b in bbox],
+    }
