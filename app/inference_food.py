@@ -1,494 +1,413 @@
-import os, io, time
+"""
+Vision Core — detecção e classificação de alimentos.
+
+Pipeline (food-v3):
+  1. YOLO-World (vocabulário aberto) localiza o alimento na cena -> bounding box.
+     É usado APENAS para recortar a região; a identidade vem do CLIP.
+  2. CLIP zero-shot com *prompt ensembling* identifica o tipo de alimento.
+     - Todos os embeddings de texto são pré-computados UMA vez (cache),
+       então cada frame faz apenas 1-2 forward-passes de imagem (rápido).
+     - Classes "distractoras" (pessoa, mão, fundo, objeto) permitem rejeitar
+       cenas sem alimento em vez de "chutar" uma fruta.
+  3. Se um alimento é reconhecido com confiança, CLIP classifica fresco vs. estragado.
+     - Só rotula "doente" quando há evidência clara; empate -> "saudavel".
+
+Decisões de projeto importantes:
+  - Quando NENHUM alimento é reconhecido com confiança, retornamos
+    "Não reconhecido" e NÃO inventamos um veredito de saúde (evita o
+    famigerado "Doente 50%").
+"""
+
+import os
 from typing import List, Tuple, Optional, Dict
-from collections import Counter
 
 import numpy as np
 from PIL import Image
 import torch
-from ultralytics import YOLO
 import open_clip
-import cv2
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MIN_DET_CONF = 0.40
-MIN_CLASS_CONF = float(os.getenv("MIN_CLASS_CONF", "0"))  
-MODEL_VERSION = "food-v2.0"  # Multi-stage verification
-
-TYPE_MIN_CONF = float(os.getenv("TYPE_MIN_CONF", "0.65"))
-
-# =========================
-# 1) Detector de alimentos
-# =========================
-FOOD_TYPES = {
-    "tomato": ["tomato", "red tomato", "ripe tomato", "cherry tomato", "roma tomato", "fresh tomato"],
-    "apple": ["apple", "red apple", "green apple", "granny smith apple", "fuji apple"],
-    "banana": ["banana", "ripe banana", "yellow banana", "green banana"],
-    "lettuce": ["lettuce", "green lettuce", "fresh lettuce", "lettuce leaves", "leafy lettuce", "loose leaf lettuce"],
-    "strawberry": ["strawberry", "fresh strawberry", "ripe strawberry"],
-    "grape": ["grape", "green grape", "red grape", "grape bunch"],
-    "orange": ["orange", "navel orange", "valencia orange", "whole orange"],
-    "cucumber": ["cucumber", "fresh cucumber", "green cucumber", "whole cucumber"],
-    "carrot": ["carrot", "orange carrot", "fresh carrot", "whole carrot"],
-    "broccoli": ["broccoli", "broccoli floret", "broccoli crown", "green broccoli", "fresh broccoli"],
-    "pineapple": ["pineapple", "whole pineapple", "fresh pineapple"],
-    "mango": ["mango", "ripe mango", "yellow mango", "fresh mango"],
-    "papaya": ["papaya", "ripe papaya", "fresh papaya"],
-    "avocado": ["avocado", "ripe avocado", "hass avocado", "fresh avocado"],
-    "pear": ["pear", "green pear", "yellow pear", "fresh pear"],
-    "kiwi": ["kiwi", "kiwi fruit", "fresh kiwi"],
-    "peach": ["peach", "ripe peach", "fresh peach"],
-    "plum": ["plum", "purple plum", "fresh plum"],
-    "bell pepper": ["bell pepper", "red bell pepper", "green bell pepper", "yellow bell pepper", "sweet pepper"],
-    "eggplant": ["eggplant", "purple eggplant", "aubergine", "fresh eggplant"],
-    "zucchini": ["zucchini", "green zucchini", "courgette", "fresh zucchini"],
-    "cabbage": ["cabbage", "green cabbage", "red cabbage", "whole cabbage"],
-    "cauliflower": ["cauliflower", "white cauliflower", "cauliflower head"],
-    "onion": ["onion", "yellow onion", "red onion", "white onion", "whole onion"],
-    "garlic": ["garlic", "garlic bulb", "garlic clove", "fresh garlic"],
-    "potato": ["potato", "brown potato", "russet potato", "whole potato"],
-    "corn": ["corn", "corn cob", "sweet corn", "yellow corn", "corn on the cob"],
-    "peas": ["peas", "green peas", "garden peas", "fresh peas"],
-    "beans": ["beans", "green beans", "string beans", "fresh beans"],
-    "spinach": ["spinach", "fresh spinach", "spinach leaves", "baby spinach"],
-}
-
-# Características visuais para distinção (alface vs brócolis, etc)
-VISUAL_DISCRIMINATORS = {
-    "lettuce_vs_broccoli": {
-        "lettuce": {
-            "texture": "smooth and wavy leaves",
-            "structure": "loose leafy structure",
-            "shape": "wide flat leaves",
-        },
-        "broccoli": {
-            "texture": "tight clustered florets",
-            "structure": "compact tree-like head",
-            "shape": "rounded dense crown",
-        }
-    },
-    "tomato_vs_apple": {
-        "tomato": {
-            "texture": "smooth skin with slight shine",
-            "features": "often has stem scar",
-            "shape": "slightly irregular round",
-        },
-        "apple": {
-            "texture": "waxy smooth skin",
-            "features": "often has stem or indent",
-            "shape": "uniformly round",
-        }
-    }
-}
-
-FOOD_VOCAB = [
-    "apple", "red apple", "green apple",
-    "banana", "yellow banana",
-    "orange", "tangerine",
-    "strawberry", "grape", "watermelon", "pineapple", "mango", "papaya", 
-    "avocado", "pear", "kiwi", "peach", "plum",
-    "tomato", "red tomato", "cherry tomato",
-    "lettuce", "green lettuce", "fresh lettuce",
-    "spinach", "fresh spinach",
-    "cabbage", "broccoli", "cauliflower", "carrot", "cucumber", 
-    "zucchini", "eggplant", "bell pepper",
-    "onion", "garlic", "potato", "corn", "peas", "green beans"
-]
 
 try:
-    _detector = YOLO("yolov8x-world.pt")
-    _detector.set_classes(FOOD_VOCAB)
+    from ultralytics import YOLO
+    _YOLO_LIB = True
 except Exception:
-    _detector = YOLO("yolov8n.pt")
+    _YOLO_LIB = False
 
-COCO_FOODS = {"apple", "banana", "orange", "broccoli", "carrot"}
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_VERSION = "food-v3.0-clip-ensemble"
 
-def _pil_to_cv(img: Image.Image):
-    arr = np.array(img.convert("RGB"))
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+# ----------------------------------------------------------------------------
+# Thresholds (ajustáveis por variável de ambiente)
+# ----------------------------------------------------------------------------
+# Confiança mínima do detector YOLO-World (baixa de propósito: YOLO-World
+# costuma ser subconfiante em enquadramentos incomuns, ex. fruta na mão).
+MIN_DET_CONF = float(os.getenv("MIN_DET_CONF", "0.08"))
+# Similaridade de cosseno mínima (absoluta) para aceitar um alimento quando o
+# YOLO já localizou a região (a caixa do YOLO-World já é um alimento).
+# CLIP ViT-B/16 (openai): match correto ~0.25-0.35, errado ~0.15-0.20.
+FOOD_ABS_FLOOR = float(os.getenv("FOOD_ABS_FLOOR", "0.195"))
+# Piso (mais alto) para o caminho de fallback, quando o YOLO NÃO detectou nada.
+# Evita "alucinar" alimento a partir de plantas/fundo verde da cena.
+FALLBACK_FLOOR = float(os.getenv("FALLBACK_FLOOR", "0.24"))
+# Probabilidade mínima de "podre" para rotular "doente" (caso contrário saudavel).
+DISEASE_MIN_CONF = float(os.getenv("DISEASE_MIN_CONF", "0.62"))
 
-def detect_food_regions(img: Image.Image, conf_thres: float = MIN_DET_CONF):
-    frame = _pil_to_cv(img)
-    res = _detector.predict(source=frame, verbose=False, conf=conf_thres)[0]
+# ----------------------------------------------------------------------------
+# Vocabulário de alimentos: chave canônica -> sinônimos/descrições em inglês
+# (CLIP é treinado majoritariamente em inglês; sinônimos ricos melhoram muito).
+# ----------------------------------------------------------------------------
+FOOD_TYPES: Dict[str, List[str]] = {
+    "tomato": ["tomato", "red tomato", "ripe tomato", "cherry tomato", "fresh tomato"],
+    "apple": ["apple", "red apple", "green apple", "fuji apple"],
+    "banana": ["banana", "a banana", "ripe yellow banana", "bunch of bananas", "green banana"],
+    "lettuce": ["lettuce", "green lettuce", "fresh lettuce leaves", "leafy lettuce", "head of lettuce", "romaine lettuce"],
+    "strawberry": ["strawberry", "fresh strawberry", "ripe strawberry"],
+    "grape": ["grape", "green grapes", "red grapes", "bunch of grapes"],
+    "orange": ["orange", "navel orange", "whole orange", "citrus orange"],
+    "cucumber": ["cucumber", "fresh cucumber", "green cucumber"],
+    "carrot": ["carrot", "a carrot", "orange carrot", "fresh carrot root", "whole carrot", "carrot vegetable"],
+    "broccoli": ["broccoli", "broccoli floret", "broccoli crown", "green broccoli head"],
+    "pineapple": ["pineapple", "whole pineapple", "fresh pineapple"],
+    "mango": ["mango", "ripe mango", "yellow mango"],
+    "papaya": ["papaya", "ripe papaya"],
+    "avocado": ["avocado", "ripe avocado", "hass avocado"],
+    "pear": ["pear", "green pear", "fresh pear"],
+    "kiwi": ["kiwi", "kiwi fruit"],
+    "peach": ["peach", "ripe peach"],
+    "plum": ["plum", "purple plum"],
+    "bell pepper": ["bell pepper", "red bell pepper", "green bell pepper", "sweet pepper"],
+    "eggplant": ["eggplant", "purple eggplant", "aubergine"],
+    "zucchini": ["zucchini", "green zucchini", "courgette"],
+    "cabbage": ["cabbage", "green cabbage", "whole cabbage"],
+    "cauliflower": ["cauliflower", "white cauliflower head"],
+    "onion": ["onion", "yellow onion", "red onion", "whole onion"],
+    "garlic": ["garlic", "garlic bulb", "garlic clove"],
+    "potato": ["potato", "brown potato", "whole potato"],
+    "corn": ["corn", "corn cob", "corn on the cob"],
+    "peas": ["peas", "green peas", "garden peas"],
+    "beans": ["green beans", "string beans"],
+    "spinach": ["spinach", "fresh spinach leaves"],
+}
 
-    boxes, names = [], []
-    if hasattr(res, "names") and isinstance(res.names, dict):
-        names = res.names
+# Classes "distractoras": NÃO são alimentos. Se uma delas vence o argmax,
+# a cena provavelmente não tem um alimento em destaque -> rejeita.
+DISTRACTORS: Dict[str, List[str]] = {
+    "person": ["a person", "a human face", "a man", "a woman", "people"],
+    "hand": ["a hand", "a human hand holding something", "fingers"],
+    "background": ["a room interior", "a bookshelf", "furniture", "a wall", "indoor background"],
+    "object": ["a random object", "an electronic gadget", "a piece of clothing", "something that is not food"],
+}
 
-    out = []
-    for i in range(len(res.boxes)):
-        b = res.boxes[i]
-        cls_id = int(b.cls.item()) if b.cls is not None else -1
-        score = float(b.conf.item()) if b.conf is not None else 0.0
-        if hasattr(b, "xyxy"):
-            x1, y1, x2, y2 = b.xyxy[0].tolist()
-        else:
-            continue
-        name = names.get(cls_id, "object")
-        if _detector.model_name.endswith("yolov8n.pt"):
-            if name not in COCO_FOODS:
-                continue
-        out.append(([x1, y1, x2, y2], name, score))
-    out.sort(key=lambda t: t[2], reverse=True)
-    return out
+# Templates aplicados a cada sinônimo (prompt ensembling).
+TEMPLATES = [
+    "a photo of a {}.",
+    "a close-up photo of a {}.",
+    "a photo of a single {}.",
+    "a hand holding a {}.",
+    "a {} on a white background.",
+    "a fresh {}.",
+    "an image of a {}.",
+]
 
-def crop_with_pad(img: Image.Image, bbox: List[float], pad: float = 0.08) -> Image.Image:
-    w, h = img.size
-    x1, y1, x2, y2 = bbox
-    cw, ch = x2 - x1, y2 - y1
-    x1 -= cw * pad
-    y1 -= ch * pad
-    x2 += cw * pad
-    y2 += ch * pad
-    x1 = int(max(0, x1))
-    y1 = int(max(0, y1))
-    x2 = int(min(w, x2))
-    y2 = int(min(h, y2))
-    return img.crop((x1, y1, x2, y2))
+# Tradução para PT-BR (apenas alimentos).
+_PT = {
+    "apple": "maçã", "banana": "banana", "orange": "laranja", "strawberry": "morango",
+    "grape": "uva", "pineapple": "abacaxi", "mango": "manga", "papaya": "mamão",
+    "avocado": "abacate", "pear": "pera", "kiwi": "kiwi", "peach": "pêssego", "plum": "ameixa",
+    "tomato": "tomate", "lettuce": "alface", "cabbage": "repolho", "broccoli": "brócolis",
+    "cauliflower": "couve-flor", "carrot": "cenoura", "cucumber": "pepino",
+    "zucchini": "abobrinha", "eggplant": "berinjela", "bell pepper": "pimentão",
+    "onion": "cebola", "garlic": "alho", "potato": "batata", "corn": "milho",
+    "peas": "ervilha", "beans": "feijão", "spinach": "espinafre",
+}
 
-# =========================
-# 2) Análise de cor dominante
-# =========================
-def analyze_color_profile(img: Image.Image) -> Dict[str, float]:
-    """
-    Analisa perfil de cor para ajudar na distinção
-    Retorna percentuais de cores dominantes
-    """
-    img_small = img.resize((100, 100))
-    arr = np.array(img_small.convert("RGB"))
-    
-    # Calcular médias de canais
-    r_mean = arr[:,:,0].mean() / 255.0
-    g_mean = arr[:,:,1].mean() / 255.0
-    b_mean = arr[:,:,2].mean() / 255.0
-    
-    # Calcular saturação média
-    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-    saturation = hsv[:,:,1].mean() / 255.0
-    value = hsv[:,:,2].mean() / 255.0
-    
-    return {
-        "red_intensity": float(r_mean),
-        "green_intensity": float(g_mean),
-        "blue_intensity": float(b_mean),
-        "saturation": float(saturation),
-        "brightness": float(value),
-    }
-
-def analyze_texture_complexity(img: Image.Image) -> float:
-    """
-    Analisa complexidade de textura usando gradientes
-    Valores maiores = textura mais complexa (ex: brócolis)
-    Valores menores = textura mais lisa (ex: alface)
-    """
-    img_gray = img.convert("L")
-    arr = np.array(img_gray)
-    
-    # Calcular gradientes
-    gx = cv2.Sobel(arr, cv2.CV_64F, 1, 0, ksize=3)
-    gy = cv2.Sobel(arr, cv2.CV_64F, 0, 1, ksize=3)
-    
-    magnitude = np.sqrt(gx**2 + gy**2)
-    complexity = magnitude.mean()
-    
-    return float(complexity)
-
-# =========================
-# 3) Classificador CLIP aprimorado
-# =========================
-_CLIP_MODEL, _CLIP_PREP, _CLIP_TOKENIZER = None, None, None
-
-def _load_clip():
-    global _CLIP_MODEL, _CLIP_PREP, _CLIP_TOKENIZER
-    if _CLIP_MODEL is None:
-        backbone = os.getenv("CLIP_BACKBONE", "ViT-B-16")
-        weights = os.getenv("CLIP_WEIGHTS", "openai")
-        _CLIP_MODEL, _, _CLIP_PREP = open_clip.create_model_and_transforms(
-            backbone, pretrained=weights, device=DEVICE
-        )
-        _CLIP_TOKENIZER = open_clip.get_tokenizer(backbone)
-        _CLIP_MODEL.eval()
-
-def _ensure_clip_loaded():
-    if _CLIP_MODEL is None:
-        _load_clip()
-
-def _embed_image_clip(img: Image.Image):
-    _ensure_clip_loaded()
-    x = _CLIP_PREP(img).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        feats = _CLIP_MODEL.encode_image(x)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-    return feats.cpu().numpy()[0]
-
-def _embed_text_clip(prompts: List[str]):
-    _ensure_clip_loaded()
-    tokens = _CLIP_TOKENIZER(prompts).to(DEVICE)
-    with torch.no_grad():
-        txt = _CLIP_MODEL.encode_text(tokens)
-        txt = txt / txt.norm(dim=-1, keepdim=True)
-    return txt.cpu().numpy()
-
-def _softmax_temperature(a: np.ndarray, temperature: float = 1.0):
-    a_scaled = a / temperature
-    m = a_scaled.max()
-    e = np.exp(a_scaled - m)
-    return e / (e.sum() + 1e-9)
-
-def classify_food_with_visual_verification(
-    img: Image.Image, 
-    yolo_prediction: str
-) -> Tuple[str, float, Dict]:
-    templates = [
-        "a clear photo of {}",
-        "a close-up photo of fresh {}",
-        "a high quality photograph of {}",
-        "{} on a plate",
-        "whole {}",
-    ]
-    
-    best_key, best_sim = None, -1.0
-    sims = []
-    keys = list(FOOD_TYPES.keys())
-    
-    for k in keys:
-        max_sim = -1.0
-        for template in templates:
-            prompts = [template.format(p) for p in FOOD_TYPES[k]]
-            txt = _embed_text_clip(prompts)
-            img_emb = _embed_image_clip(img)
-            sim = float((img_emb @ txt.T).max())
-            max_sim = max(max_sim, sim)
-        sims.append(max_sim)
-        if max_sim > best_sim:
-            best_sim, best_key = max_sim, k
-    
-    arr = np.array(sims, dtype=np.float32)
-    probs = _softmax_temperature(arr, temperature=2.5)
-    
-    top5_idx = np.argsort(probs)[-5:][::-1]
-    top5_scores = {keys[i]: float(probs[i]) for i in top5_idx}
-    
-    clip_pred = best_key
-    clip_conf = float(probs[keys.index(best_key)]) if best_key else 0.0
-    
-    color_profile = analyze_color_profile(img)
-    texture_complexity = analyze_texture_complexity(img)
-    
-    final_pred = clip_pred
-    final_conf = clip_conf
-    verification_applied = False
-    
-    if clip_pred in ["lettuce", "broccoli"] or yolo_prediction in ["lettuce", "broccoli"]:
-        verification_applied = True
-        
-        is_broccoli_texture = texture_complexity > 15.0  # threshold empírico
-        
-        discriminative_prompts_lettuce = [
-            "loose leafy lettuce with smooth wavy leaves",
-            "fresh lettuce leaves spread out",
-            "green lettuce with wide flat leaves",
-            "alface com folhas largas e lisas",
-        ]
-        discriminative_prompts_broccoli = [
-            "broccoli with tight clustered florets",
-            "broccoli crown with dense tree-like structure",
-            "compact broccoli head with small florets",
-            "brócolis com floretes agrupados",
-        ]
-        
-        img_emb = _embed_image_clip(img)
-        txt_lettuce = _embed_text_clip(discriminative_prompts_lettuce)
-        txt_broccoli = _embed_text_clip(discriminative_prompts_broccoli)
-        
-        sim_lettuce = float((img_emb @ txt_lettuce.T).max())
-        sim_broccoli = float((img_emb @ txt_broccoli.T).max())
-
-        score_lettuce = sim_lettuce * (1.0 if not is_broccoli_texture else 0.7)
-        score_broccoli = sim_broccoli * (1.2 if is_broccoli_texture else 0.8)
-        
-        probs_disc = _softmax_temperature(
-            np.array([score_lettuce, score_broccoli]), 
-            temperature=1.0
-        )
-        
-        if probs_disc[0] > probs_disc[1]:
-            final_pred = "lettuce"
-            final_conf = float(probs_disc[0])
-        else:
-            final_pred = "broccoli"
-            final_conf = float(probs_disc[1])
-    
-    elif clip_pred in ["tomato", "apple"] or yolo_prediction in ["tomato", "apple"]:
-        verification_applied = True
-        
-        red_dominant = color_profile["red_intensity"] > 0.6
-        high_saturation = color_profile["saturation"] > 0.5
-        
-        discriminative_prompts_tomato = [
-            "fresh red tomato with smooth skin",
-            "ripe tomato with stem scar",
-            "round tomato with bright red color",
-            "tomate vermelho maduro",
-        ]
-        discriminative_prompts_apple = [
-            "shiny apple with waxy skin",
-            "round apple with uniform color",
-            "fresh apple fruit",
-            "maçã vermelha brilhante",
-        ]
-        
-        img_emb = _embed_image_clip(img)
-        txt_tomato = _embed_text_clip(discriminative_prompts_tomato)
-        txt_apple = _embed_text_clip(discriminative_prompts_apple)
-        
-        sim_tomato = float((img_emb @ txt_tomato.T).max())
-        sim_apple = float((img_emb @ txt_apple.T).max())
-        
-        # Boost para tomate se muito vermelho e saturado
-        score_tomato = sim_tomato * (1.2 if (red_dominant and high_saturation) else 1.0)
-        score_apple = sim_apple
-        
-        probs_disc = _softmax_temperature(
-            np.array([score_tomato, score_apple]), 
-            temperature=1.0
-        )
-        
-        if probs_disc[0] > probs_disc[1]:
-            final_pred = "tomato"
-            final_conf = float(probs_disc[0])
-        else:
-            final_pred = "apple"
-            final_conf = float(probs_disc[1])
-    
-    return final_pred, final_conf, {
-        "top5_clip": top5_scores,
-        "color_profile": color_profile,
-        "texture_complexity": round(texture_complexity, 2),
-        "verification_applied": verification_applied,
-        "clip_initial": clip_pred,
-        "clip_initial_conf": round(clip_conf, 4),
-    }
-
-def _normalize_food_name(name: str) -> str:
-    for base_name in FOOD_TYPES.keys():
-        if base_name in name.lower():
-            return base_name
-    return name
-
-def classify_fresh_vs_rotten(img: Image.Image, detected_name: Optional[str]) -> Tuple[str, float]:
-    name = detected_name or "food item"
-    
-    prompts_fresh = [
-        f"a photo of fresh healthy {name}",
-        f"a photo of ripe vibrant {name}",
-        f"uma foto de {name} fresco e saudável",
-    ]
-    
-    prompts_rotten = [
-        f"a photo of rotten spoiled {name}",
-        f"a photo of moldy decayed {name}",
-        f"uma foto de {name} podre e estragado",
-    ]
-    
-    im = _embed_image_clip(img)
-    txt_fresh = _embed_text_clip(prompts_fresh)
-    txt_rotten = _embed_text_clip(prompts_rotten)
-    
-    s_fresh = float((im @ txt_fresh.T).max())
-    s_rottn = float((im @ txt_rotten.T).max())
-    
-    probs = _softmax_temperature(np.array([s_fresh, s_rottn]), temperature=1.5)
-    idx = int(np.argmax(probs))
-    label = "saudavel" if idx == 0 else "doente"
-    conf = float(probs[idx])
-    
-    return label, round(conf, 4)
 
 def _food_pt(name_en: Optional[str]) -> Optional[str]:
     if not name_en:
         return None
-    m = {
-        "apple": "maçã", "banana": "banana", "orange": "laranja", "strawberry": "morango", 
-        "grape": "uva", "watermelon": "melancia", "pineapple": "abacaxi", "mango": "manga", 
-        "papaya": "mamão", "avocado": "abacate", "pear": "pera", "kiwi": "kiwi", 
-        "peach": "pêssego", "plum": "ameixa",
-        "tomato": "tomate", "lettuce": "alface", "cabbage": "repolho", "broccoli": "brócolis", 
-        "cauliflower": "couve-flor", "carrot": "cenoura", "cucumber": "pepino", 
-        "zucchini": "abobrinha", "eggplant": "berinjela", "bell pepper": "pimentão", 
-        "onion": "cebola", "garlic": "alho", "potato": "batata", "corn": "milho",
-        "peas": "ervilha", "beans": "feijão", "spinach": "espinafre",
-    }
-    return m.get(name_en.lower(), name_en)
+    return _PT.get(name_en.lower(), name_en)
 
-def predict_image(img: Image.Image):
-    dets = [d for d in detect_food_regions(img, conf_thres=MIN_DET_CONF) if d[2] >= MIN_DET_CONF]
-    if not dets:
-        return "Não reconhecido", 0.0, {
-            "food": None, 
-            "food_confidence": 0.0, 
-            "bbox": None,
-            "debug": {"reason": "no_detection"}
-        }
 
-    (bbox, name_det_en, det_conf) = dets[0]
-    name_det_normalized = _normalize_food_name(name_det_en)
-    
-    crop = crop_with_pad(img, bbox, pad=0.08)
+# ----------------------------------------------------------------------------
+# CLIP — carregamento e cache de embeddings de texto
+# ----------------------------------------------------------------------------
+_CLIP_MODEL = None
+_CLIP_PREP = None
+_CLIP_TOKENIZER = None
+_LOGIT_SCALE = 100.0
 
-    type_en, type_conf, visual_analysis = classify_food_with_visual_verification(
-        crop, name_det_normalized
+# Matrizes de embedding (preenchidas uma única vez).
+_FOOD_KEYS: List[str] = list(FOOD_TYPES.keys())
+_FOOD_EMB: Optional[np.ndarray] = None        # (num_foods, d)
+_DISTRACTOR_KEYS: List[str] = list(DISTRACTORS.keys())
+_DISTRACTOR_EMB: Optional[np.ndarray] = None  # (num_distractors, d)
+
+
+def _load_clip():
+    global _CLIP_MODEL, _CLIP_PREP, _CLIP_TOKENIZER, _LOGIT_SCALE
+    if _CLIP_MODEL is not None:
+        return
+    backbone = os.getenv("CLIP_BACKBONE", "ViT-B-16")
+    weights = os.getenv("CLIP_WEIGHTS", "openai")
+    _CLIP_MODEL, _, _CLIP_PREP = open_clip.create_model_and_transforms(
+        backbone, pretrained=weights, device=DEVICE
     )
+    _CLIP_TOKENIZER = open_clip.get_tokenizer(backbone)
+    _CLIP_MODEL.eval()
+    try:
+        _LOGIT_SCALE = float(_CLIP_MODEL.logit_scale.exp().item())
+    except Exception:
+        _LOGIT_SCALE = 100.0
 
-    chosen_en = name_det_normalized
-    chosen_conf = det_conf
-    chosen_source = "yolo"
-    
-    if visual_analysis.get("verification_applied", False):
-        if type_conf >= 0.55:  
-            chosen_en = type_en
-            chosen_conf = type_conf
-            chosen_source = "clip_verified"
+
+@torch.no_grad()
+def _embed_texts(prompts: List[str]) -> np.ndarray:
+    tokens = _CLIP_TOKENIZER(prompts).to(DEVICE)
+    txt = _CLIP_MODEL.encode_text(tokens)
+    txt = txt / txt.norm(dim=-1, keepdim=True)
+    return txt.cpu().numpy()
+
+
+def _build_class_embedding(synonyms: List[str]) -> np.ndarray:
+    """Prompt ensembling: média (normalizada) sobre todos os templates×sinônimos."""
+    prompts = [t.format(s) for s in synonyms for t in TEMPLATES]
+    embs = _embed_texts(prompts)          # (N, d)
+    mean = embs.mean(axis=0)              # (d,)
+    mean = mean / (np.linalg.norm(mean) + 1e-9)
+    return mean.astype(np.float32)
+
+
+def _ensure_ready():
+    """Carrega CLIP e pré-computa TODOS os embeddings de texto (uma vez)."""
+    global _FOOD_EMB, _DISTRACTOR_EMB
+    _load_clip()
+    if _FOOD_EMB is None:
+        _FOOD_EMB = np.stack([_build_class_embedding(FOOD_TYPES[k]) for k in _FOOD_KEYS])
+    if _DISTRACTOR_EMB is None:
+        _DISTRACTOR_EMB = np.stack([_build_class_embedding(DISTRACTORS[k]) for k in _DISTRACTOR_KEYS])
+
+
+@torch.no_grad()
+def _embed_images(imgs: List[Image.Image]) -> np.ndarray:
+    """Retorna embeddings de imagem normalizados (n, d)."""
+    batch = torch.stack([_CLIP_PREP(im) for im in imgs]).to(DEVICE)
+    feats = _CLIP_MODEL.encode_image(batch)
+    feats = feats / feats.norm(dim=-1, keepdim=True)
+    return feats.cpu().numpy()
+
+
+# ----------------------------------------------------------------------------
+# Detector YOLO-World (apenas localização)
+# ----------------------------------------------------------------------------
+_FOOD_VOCAB = sorted({s for syn in FOOD_TYPES.values() for s in syn})
+_detector = None
+_detector_kind = "none"
+
+
+def _load_detector():
+    global _detector, _detector_kind
+    if _detector is not None or not _YOLO_LIB:
+        return
+    try:
+        _detector = YOLO("yolov8x-world.pt")
+        _detector.set_classes(_FOOD_VOCAB)
+        _detector_kind = "world"
+    except Exception:
+        try:
+            _detector = YOLO("yolov8n.pt")
+            _detector_kind = "coco"
+        except Exception:
+            _detector = None
+            _detector_kind = "none"
+
+
+_COCO_FOODS = {"apple", "banana", "orange", "broccoli", "carrot"}
+
+
+def _detect_box(img: Image.Image) -> Optional[List[float]]:
+    """Retorna a melhor bbox [x1,y1,x2,y2] de um alimento, ou None."""
+    _load_detector()
+    if _detector is None:
+        return None
+    try:
+        res = _detector.predict(source=np.array(img.convert("RGB"))[:, :, ::-1],
+                                verbose=False, conf=MIN_DET_CONF)[0]
+    except Exception:
+        return None
+
+    names = res.names if isinstance(getattr(res, "names", None), dict) else {}
+    best, best_score = None, -1.0
+    for b in res.boxes:
+        score = float(b.conf.item()) if b.conf is not None else 0.0
+        cls_id = int(b.cls.item()) if b.cls is not None else -1
+        name = names.get(cls_id, "")
+        if _detector_kind == "coco" and name not in _COCO_FOODS:
+            continue
+        if score > best_score and hasattr(b, "xyxy"):
+            best_score = score
+            best = b.xyxy[0].tolist()
+    return best
+
+
+def _crop_pad(img: Image.Image, bbox: List[float], pad: float = 0.12) -> Image.Image:
+    w, h = img.size
+    x1, y1, x2, y2 = bbox
+    cw, ch = x2 - x1, y2 - y1
+    x1 = int(max(0, x1 - cw * pad))
+    y1 = int(max(0, y1 - ch * pad))
+    x2 = int(min(w, x2 + cw * pad))
+    y2 = int(min(h, y2 + ch * pad))
+    if x2 <= x1 or y2 <= y1:
+        return img
+    return img.crop((x1, y1, x2, y2))
+
+
+def _center_square(img: Image.Image, frac: float = 0.7) -> Image.Image:
+    """Recorte quadrado central — objetos segurados costumam estar no centro."""
+    w, h = img.size
+    side = int(min(w, h) * frac)
+    cx, cy = w // 2, h // 2
+    return img.crop((cx - side // 2, cy - side // 2, cx + side // 2, cy + side // 2))
+
+
+# ----------------------------------------------------------------------------
+# Identificação do alimento (CLIP zero-shot multi-crop)
+# ----------------------------------------------------------------------------
+def _identify_food(views: List[Image.Image]) -> Dict:
+    """
+    Classifica entre alimentos + distractores usando várias views (TTA).
+    Para cada classe usa o MELHOR cosseno entre as views.
+    """
+    _ensure_ready()
+    img_emb = _embed_images(views)                       # (n, d)
+    food_sims = (img_emb @ _FOOD_EMB.T).max(axis=0)      # (num_foods,)
+    distr_sims = (img_emb @ _DISTRACTOR_EMB.T).max(axis=0)  # (num_distractors,)
+
+    food_idx = int(np.argmax(food_sims))
+    best_food = _FOOD_KEYS[food_idx]
+    best_food_cos = float(food_sims[food_idx])
+
+    distr_idx = int(np.argmax(distr_sims))
+    best_distr = _DISTRACTOR_KEYS[distr_idx]
+    best_distr_cos = float(distr_sims[distr_idx])
+
+    # Confiança relativa entre os alimentos (softmax calibrado pelo logit_scale).
+    logits = food_sims * _LOGIT_SCALE
+    probs = np.exp(logits - logits.max())
+    probs = probs / probs.sum()
+    food_conf = float(probs[food_idx])
+
+    order = np.argsort(food_sims)[-3:][::-1]
+    top3 = {_FOOD_KEYS[i]: round(float(food_sims[i]), 4) for i in order}
+
+    return {
+        "food": best_food,
+        "food_cos": best_food_cos,
+        "food_conf": food_conf,
+        "distractor": best_distr,
+        "distractor_cos": best_distr_cos,
+        "top3": top3,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Fresco vs. estragado
+# ----------------------------------------------------------------------------
+def _fresh_vs_rotten(img: Image.Image, food_en: str) -> Tuple[str, float]:
+    _ensure_ready()
+    n = food_en
+    # Conjuntos balanceados; usamos a MÉDIA das similaridades (não o máximo)
+    # para reduzir ruído — um único prompt que casa por acaso não decide.
+    fresh = [
+        f"a photo of a fresh {n}",
+        f"a fresh ripe healthy {n}",
+        f"a {n} in good condition",
+        f"a clean undamaged {n}",
+        f"uma foto de {n} fresco e saudável",
+    ]
+    rotten = [
+        f"a photo of a rotten {n}",
+        f"a moldy spoiled {n}",
+        f"a {n} with brown spots, mold and decay",
+        f"a damaged decaying {n}",
+        f"uma foto de {n} podre e estragado",
+    ]
+    im = _embed_images([img])[0]
+    s_fresh = float((im @ _embed_texts(fresh).T).mean())
+    s_rotten = float((im @ _embed_texts(rotten).T).mean())
+
+    logits = np.array([s_fresh, s_rotten]) * _LOGIT_SCALE
+    e = np.exp(logits - logits.max())
+    probs = e / e.sum()
+    p_rotten = float(probs[1])
+
+    # Só acusa "doente" com evidência clara; do contrário, saudável.
+    if p_rotten >= DISEASE_MIN_CONF:
+        return "doente", round(p_rotten, 4)
+    # Confiança do rótulo saudável = certeza de NÃO estar estragado.
+    return "saudavel", round(1.0 - p_rotten, 4)
+
+
+# ----------------------------------------------------------------------------
+# API pública
+# ----------------------------------------------------------------------------
+def _not_recognized(debug: Dict) -> Tuple[str, float, Dict]:
+    return "Não reconhecido", 0.0, {
+        "food": None, "food_confidence": 0.0, "bbox": None, "debug": debug
+    }
+
+
+def predict_image(img: Image.Image) -> Tuple[str, float, Dict]:
+    img = img.convert("RGB")
+    bbox = _detect_box(img)
+
+    # Monta as "views" para o CLIP.
+    if bbox is not None:
+        crop = _crop_pad(img, bbox)
+        # Crop justo (sem padding) p/ avaliar saúde: menos fundo = menos falso "podre".
+        health_crop = _crop_pad(img, bbox, pad=0.0)
+        views = [crop]
+        bbox_out = [int(v) for v in bbox]
+        from_yolo = True
     else:
-        if type_en and type_conf >= TYPE_MIN_CONF:
-            if type_en != name_det_normalized:
-                if type_conf > det_conf + 0.15:
-                    chosen_en = type_en
-                    chosen_conf = type_conf
-                    chosen_source = "clip_override"
-                else:
-                    chosen_source = "yolo_kept"
-            else:
-                chosen_conf = max(det_conf, type_conf)
-                chosen_source = "consensus"
+        # Sem detecção: imagem inteira + recorte central (ajuda objeto segurado).
+        crop = _center_square(img)
+        health_crop = crop
+        views = [img, crop]
+        bbox_out = None
+        from_yolo = False
 
-    label, class_conf = classify_fresh_vs_rotten(crop, chosen_en)
+    info = _identify_food(views)
 
-    if MIN_CLASS_CONF and class_conf < MIN_CLASS_CONF:
-        return "Não reconhecido", class_conf, {
-            "food": _food_pt(chosen_en),
-            "food_confidence": float(chosen_conf),
-            "bbox": [int(b) for b in bbox],
-            "debug": {
-                "yolo_name": name_det_en,
-                "yolo_conf": float(det_conf),
-                "clip_name": type_en,
-                "clip_conf": float(type_conf),
-                "chosen_source": chosen_source,
-                "class_conf_too_low": True,
-                **visual_analysis
-            }
-        }
+    # Critério de aceitação:
+    #  - Com box do YOLO: a região já é um alimento -> basta o piso absoluto.
+    #  - Sem box (fallback): exige piso mais alto E que o alimento supere a
+    #    melhor classe distractora (pessoa/mão/fundo) — senão é cena sem comida.
+    if from_yolo:
+        passes_floor = info["food_cos"] >= FOOD_ABS_FLOOR
+        beats_distractor = True
+    else:
+        passes_floor = info["food_cos"] >= FALLBACK_FLOOR
+        beats_distractor = info["food_cos"] >= info["distractor_cos"]
+
+    debug = {
+        "detector": _detector_kind,
+        "from_yolo": from_yolo,
+        "food_cos": round(info["food_cos"], 4),
+        "distractor": info["distractor"],
+        "distractor_cos": round(info["distractor_cos"], 4),
+        "top3": info["top3"],
+    }
+
+    if not (passes_floor and beats_distractor):
+        debug["reason"] = "no_confident_food"
+        return _not_recognized(debug)
+
+    food_en = info["food"]
+    label, class_conf = _fresh_vs_rotten(health_crop, food_en)
 
     return label, class_conf, {
-        "food": _food_pt(chosen_en),
-        "food_confidence": float(chosen_conf),
-        "bbox": [int(b) for b in bbox],
-        "debug": {
-            "yolo_name": name_det_en,
-            "yolo_conf": float(det_conf),
-            "clip_name": type_en,
-            "clip_conf": float(type_conf),
-            "chosen_source": chosen_source,
-            **visual_analysis
-        }
+        "food": _food_pt(food_en),
+        "food_confidence": round(info["food_conf"], 4),
+        "bbox": bbox_out,
+        "debug": {**debug, "food_en": food_en},
     }
